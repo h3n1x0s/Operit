@@ -29,7 +29,9 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.Dispatchers as CoroutineDispatchers
 
 /** 基于Root权限的Shell命令执行器 实现ROOT权限级别的命令执行 */
@@ -37,7 +39,18 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
     companion object {
         private const val TAG = "RootShellExecutor"
         private var rootAvailable: Boolean? = null
-        
+
+        /**
+         * 单条 root 命令的最长等待时间。
+         *
+         * libsu 的 `Job.exec()` 没有超时，共享 shell 一旦被卡住就会永久阻塞后续所有命令，
+         * 所以这里在调用侧补一个上限，保证工具调用总能返回。
+         */
+        private const val LIBSU_COMMAND_TIMEOUT_MS = 60_000L
+
+        /** 探测被怀疑挂起的共享 shell 是否恢复时的等待上限。 */
+        private const val WEDGED_PROBE_TIMEOUT_MS = 3_000L
+
         // 静态初始化，确保Shell配置只被设置一次
         init {
             // 配置 libsu 库的全局设置
@@ -55,8 +68,114 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
     private var useExecMode = false
     private var suCommand: String = AndroidPermissionPreferences.DEFAULT_SU_COMMAND
 
+    /**
+     * 上一次 libsu 命令是否超时未返回。
+     *
+     * libsu 的 "main shell" 是进程级单例，所有 `Shell.cmd()` 都串行跑在同一个交互式 su 进程上，
+     * 且 `Shell.Builder.setTimeout()` 只约束 shell 建立/校验阶段，**不约束 `Job.exec()`**。
+     * 因此一旦某条命令永不返回（交互式提示、等待 stdin、子进程挂死），共享 shell 就被卡住，
+     * 之后所有 root 命令都会排在它后面无限期等待。
+     *
+     * 这里用一个标记把"shell 可能已挂起"暴露出来，让后续调用快速失败而不是继续堆积阻塞，
+     * 同时也给用户一个明确的原因，而不是表现为整机卡死。
+     */
+    @Volatile
+    private var shellSuspectedWedged = false
+
     init {
         AppLogger.d(TAG, "RootShellExecutor实例初始化")
+    }
+
+    /**
+     * 读取一个流直到 EOF。
+     *
+     * 必须能在独立线程上并发调用：如果先读完 stdout 再读 stderr，当子进程向 stderr 写入超过
+     * 管道缓冲区（Android 上通常 64KB）时，子进程会阻塞在写 stderr 上，而我们在阻塞读 stdout，
+     * 双方互等形成死锁。
+     */
+    private fun drainStream(stream: InputStream): String {
+        val builder = StringBuilder()
+        try {
+            BufferedReader(InputStreamReader(stream)).use { reader ->
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    builder.append(line).append("\n")
+                }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "读取命令输出流失败: ${e.message}")
+        }
+        return builder.toString()
+    }
+
+    private fun drainStreamAsync(stream: InputStream): CompletableFuture<String> =
+        CompletableFuture.supplyAsync { drainStream(stream) }
+
+    /**
+     * 执行 libsu 命令并施加超时。
+     *
+     * @return 命令结果；超时返回 null（此时共享 shell 被视为可能已挂起）
+     */
+    private fun execWithTimeout(
+        command: String,
+        timeoutMs: Long = LIBSU_COMMAND_TIMEOUT_MS
+    ): Shell.Result? {
+        val future = CompletableFuture.supplyAsync { Shell.cmd(command).exec() }
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            AppLogger.e(
+                TAG,
+                "Root 命令在 ${timeoutMs}ms 内没有返回，判定共享 su shell 已挂起。" +
+                    "后续 root 命令将被快速拒绝，直到 shell 恢复。命令: $command"
+            )
+            future.cancel(true)
+            shellSuspectedWedged = true
+            null
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "libsu 命令执行失败: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun wedgedShellMessage(): String =
+        "Root shell is unresponsive: a previous command never returned and the shared su " +
+            "session is still blocked. libsu provides no per-command timeout, so new root " +
+            "commands are rejected instead of queueing forever. Restart the app (or the root " +
+            "manager) to rebuild the shell, and avoid commands that wait on stdin."
+
+    /**
+     * 检查被怀疑挂起的共享 shell 是否已经恢复。
+     *
+     * `waitAndClose(timeout)` 在超时后返回 false 且不会终止 shell，因此可以用它做一次
+     * 非破坏性的"是否还忙"探测：返回 true 说明之前的命令终于结束了。
+     */
+    private fun clearWedgedFlagIfRecovered(): Boolean {
+        if (!shellSuspectedWedged) return true
+        val cached = try {
+            Shell.getCachedShell()
+        } catch (e: Exception) {
+            null
+        }
+        if (cached == null) {
+            // 没有缓存 shell，下一次 Shell.getShell() 会重新构建一个。
+            shellSuspectedWedged = false
+            rootAvailable = null
+            return true
+        }
+        val recovered = try {
+            cached.waitAndClose(WEDGED_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            false
+        }
+        if (recovered) {
+            AppLogger.i(TAG, "共享 su shell 已恢复，清除挂起标记")
+            shellSuspectedWedged = false
+            rootAvailable = null
+        } else {
+            AppLogger.w(TAG, "共享 su shell 仍然忙碌/挂起，继续拒绝 root 命令")
+        }
+        return recovered
     }
 
     /**
@@ -305,27 +424,22 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
 
                 // 执行su -c命令
                 val process = Runtime.getRuntime().exec(buildSuExecCommand(command))
-                
-                // 读取标准输出
-                val stdoutReader = BufferedReader(InputStreamReader(process.inputStream))
-                val stdout = StringBuilder()
-                var line: String?
-                while (stdoutReader.readLine().also { line = it } != null) {
-                    stdout.append(line).append("\n")
-                }
-                
-                // 读取标准错误
-                val stderrReader = BufferedReader(InputStreamReader(process.errorStream))
-                val stderr = StringBuilder()
-                while (stderrReader.readLine().also { line = it } != null) {
-                    stderr.append(line).append("\n")
-                }
-                
+
+                // 并发读取 stdout / stderr。顺序读取会在子进程向 stderr 写入超过管道缓冲区
+                // （约 64KB）时死锁：子进程阻塞在写 stderr，而我们阻塞在读 stdout。
+                val stderrFuture = drainStreamAsync(process.errorStream)
+                val stdoutStr = drainStream(process.inputStream).trimEnd()
+
                 // 等待进程完成并获取退出码
                 val exitCode = process.waitFor()
-                
-                val stdoutStr = stdout.toString().trimEnd()
-                val stderrStr = stderr.toString().trimEnd()
+
+                val stderrStr =
+                    try {
+                        stderrFuture.get(5, TimeUnit.SECONDS).trimEnd()
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "读取 stderr 超时或失败: ${e.message}")
+                        ""
+                    }
                 
                 AppLogger.d(TAG, "exec执行完成，退出码: $exitCode")
                 if (stdoutStr.isNotEmpty()) {
@@ -361,6 +475,17 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
                 try {
                     applyExecutionModePreferenceOverride()
 
+                    // 快速失败：共享 su shell 上次超时未返回且仍未恢复时，继续提交命令只会
+                    // 让更多调用堆在同一个被卡住的 shell 后面（表现为整个应用卡死）。
+                    if (!useExecMode && !clearWedgedFlagIfRecovered()) {
+                        return@withContext ShellExecutor.CommandResult(
+                            false,
+                            "",
+                            wedgedShellMessage(),
+                            -1
+                        )
+                    }
+
                     val permStatus = hasPermission()
                     if (!permStatus.granted) {
                         return@withContext ShellExecutor.CommandResult(false, "", permStatus.reason)
@@ -385,23 +510,19 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
                                     val fullCmd = "$launcherPath $actualCommand"
                                     val process = Runtime.getRuntime().exec(buildSuExecCommand(fullCmd))
 
-                                    val stdoutReader = BufferedReader(InputStreamReader(process.inputStream))
-                                    val stdout = StringBuilder()
-                                    var line: String?
-                                    while (stdoutReader.readLine().also { line = it } != null) {
-                                        stdout.append(line).append("\n")
-                                    }
-
-                                    val stderrReader = BufferedReader(InputStreamReader(process.errorStream))
-                                    val stderr = StringBuilder()
-                                    while (stderrReader.readLine().also { line = it } != null) {
-                                        stderr.append(line).append("\n")
-                                    }
+                                    // 并发读取两个流，避免管道缓冲区写满导致的死锁（见 drainStream 注释）
+                                    val stderrFuture = drainStreamAsync(process.errorStream)
+                                    val stdoutStr = drainStream(process.inputStream).trimEnd()
 
                                     val exitCode = process.waitFor()
 
-                                    val stdoutStr = stdout.toString().trimEnd()
-                                    val stderrStr = stderr.toString().trimEnd()
+                                    val stderrStr =
+                                        try {
+                                            stderrFuture.get(5, TimeUnit.SECONDS).trimEnd()
+                                        } catch (e: Exception) {
+                                            AppLogger.w(TAG, "读取 stderr 超时或失败: ${e.message}")
+                                            ""
+                                        }
 
                                     AppLogger.d(TAG, "shell launcher命令(exec)执行完成，退出码: $exitCode")
                                     if (stdoutStr.isNotEmpty()) {
@@ -419,7 +540,13 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
                                     )
                                 } else {
                                     val shellCommand = "$launcherPath $actualCommand"
-                                    val shellResult = Shell.cmd(shellCommand).exec()
+                                    val shellResult = execWithTimeout(shellCommand)
+                                        ?: return@withContext ShellExecutor.CommandResult(
+                                            false,
+                                            "",
+                                            wedgedShellMessage(),
+                                            -1
+                                        )
 
                                     val stdout = shellResult.out.joinToString("\n")
                                     val stderr = shellResult.err.joinToString("\n")
@@ -448,7 +575,13 @@ class RootShellExecutor(private val context: Context) : ShellExecutor {
                                 executeCommandWithExec(actualCommand)
                             } else {
                                 AppLogger.d(TAG, "执行Root命令: $actualCommand (原始命令: $command)")
-                                val shellResult = Shell.cmd(actualCommand).exec()
+                                val shellResult = execWithTimeout(actualCommand)
+                                    ?: return@withContext ShellExecutor.CommandResult(
+                                        false,
+                                        "",
+                                        wedgedShellMessage(),
+                                        -1
+                                    )
 
                                 val stdout = shellResult.out.joinToString("\n")
                                 val stderr = shellResult.err.joinToString("\n")
