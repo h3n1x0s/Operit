@@ -1,0 +1,34 @@
+diff --git a/src/main/java/com/ai/assistance/operit/terminal/view/domain/OutputProcessor.kt b/src/main/java/com/ai/assistance/operit/terminal/view/domain/OutputProcessor.kt
+index d79a741..18b5b78 100644
+--- a/src/main/java/com/ai/assistance/operit/terminal/view/domain/OutputProcessor.kt
++++ b/src/main/java/com/ai/assistance/operit/terminal/view/domain/OutputProcessor.kt
+@@ -313,11 +313,24 @@ class OutputProcessor(
+         }
+ 
+         val trimmed = line.trim()
+-        return trimmed.endsWith("$") ||
+-                trimmed.endsWith("#") ||
+-                trimmed.endsWith("$ ") ||
+-                trimmed.endsWith("# ") ||
+-                Regex(".*@[a-zA-Z0-9.\\-]+\\s?:\\s?~?/?.*[#$]\\s*$").matches(trimmed) ||
++        // 本环境的提示符有两种形态：
++        //   1) 裸提示符 —— /etc/profile 把 root 的 PS1 设为 "# "，普通用户为 "$ "；
++        //   2) 结构化提示符 —— /etc/bash.bashrc 与 ~/.bashrc 的 "\u@\h:\w\$ "，
++        //      形如 "root@host:/root# "（\w 展开后可能含空格，由下面的正则整体匹配）。
++        //
++        // 这里刻意不再使用 endsWith("$")/endsWith("#")：isPrompt 会被 handleReadyState
++        // 作用在**每一行输出**上，只要某行以 $ 或 # 结尾（例如 "total: $"、以 # 结尾的
++        // 日志行、grep 结果）就会被当成提示符，把仍在运行的命令提前判定为完成，
++        // 之后的输出会串到下一个命令上。
++        //
++        // 裸提示符不含内部空白，用这一点把提示符和普通输出行区分开。
++        if (trimmed.isNotEmpty() &&
++            !trimmed.contains(' ') &&
++            (trimmed.endsWith("$") || trimmed.endsWith("#"))
++        ) {
++            return true
++        }
++        return Regex(".*@[a-zA-Z0-9.\\-]+\\s?:\\s?~?/?.*[#$]\\s*$").matches(trimmed) ||
+                 Regex("root@[a-zA-Z0-9.\\-]+:\\s?~?/?.*#\\s*$").matches(trimmed)
+     }
+ 

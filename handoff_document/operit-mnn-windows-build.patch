@@ -1,0 +1,78 @@
+diff --git a/llm/mnn/CMakeLists.txt b/llm/mnn/CMakeLists.txt
+index 124339c..49f0165 100644
+--- a/llm/mnn/CMakeLists.txt
++++ b/llm/mnn/CMakeLists.txt
+@@ -47,6 +47,16 @@ set(OPERIT_MNN_FLATC_CMAKE_ARGS
+     "-DCMAKE_BUILD_TYPE=Release"
+ )
+ 
++option(OPERIT_MNN_FORCE_SCHEMA_REGEN
++    "Require regenerating MNN schema/current headers (needs a host C++ compiler)"
++    OFF)
++
++# Regenerating schema/current needs a *host* C++ compiler to build FlatBuffers'
++# flatc. That compiler is not part of the Android NDK toolchain, so on hosts
++# without one (e.g. Windows without MSVC/MinGW) fall back to the headers MNN
++# checks in at the pinned commit -- they are consistent with that revision.
++set(OPERIT_MNN_SCHEMA_REGEN_ENABLED OFF)
++
+ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+     find_program(OPERIT_MNN_HOST_C_COMPILER NAMES gcc NO_CMAKE_FIND_ROOT_PATH)
+     find_program(OPERIT_MNN_HOST_CXX_COMPILER NAMES g++ NO_CMAKE_FIND_ROOT_PATH)
+@@ -57,6 +67,20 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+         "-DCMAKE_C_COMPILER=${OPERIT_MNN_HOST_C_COMPILER}"
+         "-DCMAKE_CXX_COMPILER=${OPERIT_MNN_HOST_CXX_COMPILER}"
+     )
++    set(OPERIT_MNN_SCHEMA_REGEN_ENABLED ON)
++elseif(OPERIT_MNN_FORCE_SCHEMA_REGEN)
++    find_program(OPERIT_MNN_HOST_C_COMPILER NAMES gcc clang cl NO_CMAKE_FIND_ROOT_PATH)
++    find_program(OPERIT_MNN_HOST_CXX_COMPILER NAMES g++ clang++ NO_CMAKE_FIND_ROOT_PATH)
++    if(NOT OPERIT_MNN_HOST_C_COMPILER OR NOT OPERIT_MNN_HOST_CXX_COMPILER)
++        message(FATAL_ERROR
++            "OPERIT_MNN_FORCE_SCHEMA_REGEN=ON but no host C/C++ compiler was found on "
++            "${CMAKE_HOST_SYSTEM_NAME}. Install gcc/g++ (or MSVC) and retry.")
++    endif()
++    list(APPEND OPERIT_MNN_FLATC_CMAKE_ARGS
++        "-DCMAKE_C_COMPILER=${OPERIT_MNN_HOST_C_COMPILER}"
++        "-DCMAKE_CXX_COMPILER=${OPERIT_MNN_HOST_CXX_COMPILER}"
++    )
++    set(OPERIT_MNN_SCHEMA_REGEN_ENABLED ON)
+ endif()
+ 
+ if(NOT CMAKE_HOST_WIN32)
+@@ -66,6 +90,14 @@ if(NOT CMAKE_HOST_WIN32)
+     list(APPEND OPERIT_MNN_FLATC_CMAKE_ARGS "-DCMAKE_CXX_FLAGS_RELEASE=-Wno-error")
+ endif()
+ 
++if(NOT OPERIT_MNN_SCHEMA_REGEN_ENABLED)
++    message(STATUS
++        "No host C++ compiler on ${CMAKE_HOST_SYSTEM_NAME}; using MNN's checked-in "
++        "schema/current headers for ${OPERIT_MNN_GIT_REF} instead of regenerating them. "
++        "Set -DOPERIT_MNN_FORCE_SCHEMA_REGEN=ON to require regeneration.")
++endif()
++
++if(OPERIT_MNN_SCHEMA_REGEN_ENABLED)
+ execute_process(
+     COMMAND "${CMAKE_COMMAND}"
+         ${OPERIT_MNN_FLATC_CMAKE_ARGS}
+@@ -141,6 +173,20 @@ if(NOT "${OPERIT_MNN_SCHEMA_GENERATE_RESULT}" STREQUAL "0")
+         "${OPERIT_MNN_SCHEMA_GENERATE_ERROR}"
+     )
+ endif()
++else()
++    # Schema regeneration is disabled (no host C++ compiler). MNN checks in the
++    # generated headers at every commit, so use them -- but verify they exist.
++    file(GLOB OPERIT_MNN_CHECKED_IN_SCHEMA_HEADERS
++        "${MNN_SOURCE_DIR}/schema/current/*.h")
++    if(NOT OPERIT_MNN_CHECKED_IN_SCHEMA_HEADERS)
++        message(FATAL_ERROR
++            "MNN schema regeneration is disabled, but ${MNN_SOURCE_DIR}/schema/current "
++            "contains no checked-in headers. Install a host C++ compiler and rebuild, "
++            "or set -DOPERIT_MNN_FORCE_SCHEMA_REGEN=ON to require regeneration.")
++    endif()
++    message(STATUS
++        "Using MNN's checked-in schema headers from ${MNN_SOURCE_DIR}/schema/current.")
++endif()
+ 
+ # 使用 CMake Policy CMP0077 来让 set() 覆盖 option()
+ if(POLICY CMP0077)

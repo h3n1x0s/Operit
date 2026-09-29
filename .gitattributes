@@ -1,0 +1,3 @@
+# Keep patch files byte-exact so `git apply` works on any platform, regardless of
+# the checkout's core.autocrlf setting.
+*.patch text eol=lf
